@@ -1,6 +1,6 @@
 # Copyright (C) 2012 Anaconda, Inc
 # SPDX-License-Identifier: BSD-3-Clause
-"""S3 transport adapter using shared TransferManager for parallel downloads."""
+"""S3 transport adapter with CRT acceleration support."""
 
 from __future__ import annotations
 
@@ -22,37 +22,40 @@ if TYPE_CHECKING:
 log = getLogger(__name__)
 stderrlog = LoggerAdapter(getLogger("conda.stderrlog"), extra=dict(terminator="\n"))
 
-# Module-level singleton for shared TransferManager
-_transfer_manager = None
-_transfer_lock = threading.Lock()
+_s3_client = None
+_transfer_config = None
+_client_lock = threading.Lock()
 
 
-def get_transfer_manager():
-    """Lazily initialize a shared S3Transfer singleton."""
-    global _transfer_manager
-    if _transfer_manager is None:
-        with _transfer_lock:
-            if _transfer_manager is None:
-                from boto3.s3.transfer import S3Transfer, TransferConfig
+def _get_s3_client_and_config():
+    """Get shared S3 client and TransferConfig with CRT support."""
+    global _s3_client, _transfer_config
+    if _s3_client is None:
+        with _client_lock:
+            if _s3_client is None:
+                from boto3.s3.transfer import TransferConfig
                 from boto3.session import Session
 
                 from ....base.context import context
 
-                client = Session().client("s3")
-                config = TransferConfig(
+                _s3_client = Session().client("s3")
+                # Use 'crt' to enable CRT acceleration when awscrt is installed
+                # Falls back to classic transfer if CRT unavailable
+                _transfer_config = TransferConfig(
                     max_concurrency=context.s3_max_concurrency,
                     multipart_threshold=context.s3_multipart_chunksize,
                     multipart_chunksize=context.s3_multipart_chunksize,
+                    preferred_transfer_client="crt",
                 )
-                _transfer_manager = S3Transfer(client, config)
-    return _transfer_manager
+    return _s3_client, _transfer_config
 
 
 def reset_transfer_manager():
     """Reset singleton for testing or credential refresh."""
-    global _transfer_manager
-    with _transfer_lock:
-        _transfer_manager = None
+    global _s3_client, _transfer_config
+    with _client_lock:
+        _s3_client = None
+        _transfer_config = None
 
 
 class S3Adapter(BaseAdapter):
@@ -85,15 +88,12 @@ class S3Adapter(BaseAdapter):
         pass
 
     def _send_boto3(self, resp: Response, request: PreparedRequest) -> Response:
-        from boto3.session import Session
         from botocore.exceptions import BotoCoreError, ClientError
 
         bucket_name, key_string = url_to_s3_info(request.url)
         key = key_string[1:]  # strip leading /
 
-        session = Session()
-        client = session.client("s3")
-        transfer = get_transfer_manager()
+        client, config = _get_s3_client_and_config()
 
         try:
             head = client.head_object(Bucket=bucket_name, Key=key)
@@ -102,7 +102,8 @@ class S3Adapter(BaseAdapter):
             os.close(fd)
 
             try:
-                transfer.download_file(bucket_name, key, tmp_path)
+                # Use client.download_file() to enable CRT acceleration
+                client.download_file(bucket_name, key, tmp_path, Config=config)
 
                 fh = SpooledTemporaryFile()
                 with open(tmp_path, "rb") as f:
