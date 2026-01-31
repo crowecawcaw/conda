@@ -12,26 +12,114 @@ This GitHub Action generates weekly user activity reports by querying a DSQL dat
 
 ## Setup
 
-### 1. Configure GitHub Secrets
+### 1. Configure AWS OIDC Authentication
+
+This workflow uses AWS OIDC (OpenID Connect) to authenticate with AWS, eliminating the need for long-lived AWS credentials.
+
+**Step 1: Set up AWS IAM OIDC Provider (if not already configured)**
+
+In your AWS account, create an OIDC identity provider for GitHub Actions:
+- Provider URL: `https://token.actions.githubusercontent.com`
+- Audience: `sts.amazonaws.com`
+
+**Step 2: Create IAM Role for GitHub Actions**
+
+Create an IAM role with the following trust policy (replace `YOUR_ORG` and `YOUR_REPO`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:YOUR_ORG/YOUR_REPO:*"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Step 3: Attach IAM Policies**
+
+Attach the following permissions to the IAM role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/conda/database/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricStatistics"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+### 2. Configure SSM Parameters
+
+Store database credentials in AWS Systems Manager Parameter Store as SecureString parameters:
+
+```bash
+aws ssm put-parameter \
+  --name "/conda/database/host" \
+  --value "your-database-host.amazonaws.com" \
+  --type "String"
+
+aws ssm put-parameter \
+  --name "/conda/database/port" \
+  --value "5432" \
+  --type "String"
+
+aws ssm put-parameter \
+  --name "/conda/database/name" \
+  --value "your-database-name" \
+  --type "String"
+
+aws ssm put-parameter \
+  --name "/conda/database/user" \
+  --value "your-database-user" \
+  --type "String"
+
+aws ssm put-parameter \
+  --name "/conda/database/password" \
+  --value "your-database-password" \
+  --type "SecureString"
+```
+
+### 3. Configure GitHub Secrets
 
 Add the following secrets to your GitHub repository (Settings → Secrets and variables → Actions):
 
-**Database Connection:**
-- `DSQL_HOST`: Your DSQL database host address
-- `DSQL_PORT`: Database port (optional, defaults to 5432)
-- `DSQL_DATABASE`: Database name
-- `DSQL_USER`: Database username
-- `DSQL_PASSWORD`: Database password
+**Required:**
+- `AWS_ROLE_ARN`: ARN of the IAM role created in step 1 (e.g., `arn:aws:iam::123456789012:role/GitHubActionsRole`)
 
-**AWS CloudWatch:**
-- `AWS_ACCESS_KEY_ID`: AWS access key ID
-- `AWS_SECRET_ACCESS_KEY`: AWS secret access key
-- `AWS_REGION`: AWS region (optional, defaults to us-east-1)
+**Optional:**
+- `AWS_REGION`: AWS region (defaults to us-east-1)
+- `SSM_PARAMETER_PREFIX`: SSM parameter prefix (defaults to `/conda/database`)
+- `CLOUDWATCH_NAMESPACE`: CloudWatch namespace (defaults to `CondaService`)
 
-**CloudWatch Namespace (optional):**
-- `CLOUDWATCH_NAMESPACE`: CloudWatch namespace (defaults to 'CondaService')
-
-### 2. Customize Database Schema
+### 4. Customize Database Schema
 
 The script assumes the following database tables exist:
 
@@ -60,9 +148,9 @@ CREATE TABLE emails_sent (
 );
 ```
 
-**If your schema differs**, edit the SQL query in `user_activity_report.py` at line ~85.
+**If your schema differs**, edit the SQL query in `user_activity_report.py` in the `get_user_activity()` method.
 
-### 3. Customize CloudWatch Metrics
+### 5. Customize CloudWatch Metrics
 
 The script queries for these CloudWatch metrics:
 - `InputRequests` - Total input requests
@@ -70,7 +158,7 @@ The script queries for these CloudWatch metrics:
 - `InputBytes` - Total input bytes
 - `OutputBytes` - Total output bytes
 
-**If your metrics differ**, edit the `metric_configs` in `user_activity_report.py` at line ~133.
+**If your metrics differ**, edit the `metric_configs` in `user_activity_report.py` in the `get_cloudwatch_metrics()` method.
 
 ## Usage
 
@@ -129,17 +217,33 @@ Total Output Bytes    :         23,456,789
 
 ## Troubleshooting
 
+### AWS OIDC Authentication Issues
+
+- Verify the `AWS_ROLE_ARN` secret is correctly set in GitHub
+- Ensure the IAM role trust policy allows your GitHub repository
+- Check that the OIDC provider is properly configured in AWS IAM
+- Verify the IAM role has the necessary permissions (SSM and CloudWatch)
+
+### SSM Parameter Issues
+
+- Ensure all required parameters exist in SSM Parameter Store
+- Verify the parameter names match the prefix configured (default: `/conda/database`)
+- Check that the IAM role has `ssm:GetParameter` permission for the parameter path
+- Use `aws ssm get-parameter --name /conda/database/host` to verify parameters exist
+
 ### Database Connection Issues
 
-- Verify all database credentials are correctly set in GitHub Secrets
+- Verify all database credentials are correctly stored in SSM Parameter Store
 - Ensure the DSQL database allows connections from GitHub Actions IP ranges
 - Check database firewall rules and security groups
+- Test database connectivity from an EC2 instance in the same VPC
 
 ### CloudWatch Connection Issues
 
-- Verify AWS credentials have CloudWatch read permissions
+- Verify the IAM role has CloudWatch read permissions
 - Ensure the IAM policy includes `cloudwatch:GetMetricStatistics`
 - Check that the CloudWatch namespace and metric names are correct
+- Verify metrics exist in CloudWatch for the specified time range
 
 ### Schema Mismatch
 
@@ -149,14 +253,13 @@ If you see SQL errors, your database schema likely differs from the assumed stru
 
 ### Local Testing
 
+For local testing, you can either:
+
+**Option 1: Use AWS SSM (recommended)**
 ```bash
-# Set environment variables
-export DSQL_HOST=your-db-host
-export DSQL_DATABASE=your-db
-export DSQL_USER=your-user
-export DSQL_PASSWORD=your-password
-export AWS_ACCESS_KEY_ID=your-key
-export AWS_SECRET_ACCESS_KEY=your-secret
+# Configure AWS credentials (use AWS CLI or environment variables)
+export AWS_REGION=us-east-1
+export SSM_PARAMETER_PREFIX=/conda/database
 
 # Install dependencies
 pip install boto3 psycopg2-binary
@@ -164,6 +267,10 @@ pip install boto3 psycopg2-binary
 # Run the script
 python .github/scripts/user_activity_report.py
 ```
+
+**Option 2: Mock SSM with direct environment variables**
+
+You'll need to modify the script temporarily to read from environment variables instead of SSM, or create a separate test configuration.
 
 ## License
 

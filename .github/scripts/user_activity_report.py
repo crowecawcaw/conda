@@ -27,43 +27,73 @@ class UserActivityReporter:
 
     def __init__(self):
         """Initialize database and AWS connections."""
-        # Database configuration
-        self.db_config = {
-            'host': os.environ.get('DSQL_HOST'),
-            'port': os.environ.get('DSQL_PORT', '5432'),
-            'database': os.environ.get('DSQL_DATABASE'),
-            'user': os.environ.get('DSQL_USER'),
-            'password': os.environ.get('DSQL_PASSWORD'),
-        }
-
         # AWS configuration
         self.aws_region = os.environ.get('AWS_REGION', 'us-east-1')
         self.cloudwatch_namespace = os.environ.get('CLOUDWATCH_NAMESPACE', 'CondaService')
+        self.ssm_parameter_prefix = os.environ.get('SSM_PARAMETER_PREFIX', '/conda/database')
 
-        # Validate configuration
-        self._validate_config()
+        # Initialize AWS clients
+        self.ssm = boto3.client('ssm', region_name=self.aws_region)
+        self.cloudwatch = None
+
+        # Database configuration (will be populated from SSM)
+        self.db_config = {}
 
         # Initialize connections
         self.db_conn = None
-        self.cloudwatch = None
 
-    def _validate_config(self):
-        """Validate required environment variables are set."""
-        required_vars = ['DSQL_HOST', 'DSQL_DATABASE', 'DSQL_USER', 'DSQL_PASSWORD']
-        missing = [var for var in required_vars if not os.environ.get(var)]
+        # Fetch database credentials from SSM
+        self._load_database_config()
 
-        if missing:
-            print(f"Error: Missing required environment variables: {', '.join(missing)}")
-            print("\nRequired environment variables:")
-            print("  - DSQL_HOST: Database host address")
-            print("  - DSQL_DATABASE: Database name")
-            print("  - DSQL_USER: Database username")
-            print("  - DSQL_PASSWORD: Database password")
-            print("  - DSQL_PORT: Database port (optional, defaults to 5432)")
-            print("\nFor CloudWatch metrics:")
-            print("  - AWS_ACCESS_KEY_ID: AWS access key")
-            print("  - AWS_SECRET_ACCESS_KEY: AWS secret key")
-            print("  - AWS_REGION: AWS region (optional, defaults to us-east-1)")
+    def _get_ssm_parameter(self, parameter_name: str, decrypt: bool = True) -> str:
+        """
+        Retrieve a parameter from AWS Systems Manager Parameter Store.
+
+        Args:
+            parameter_name: Name or path of the parameter
+            decrypt: Whether to decrypt SecureString parameters
+
+        Returns:
+            Parameter value
+        """
+        try:
+            response = self.ssm.get_parameter(
+                Name=parameter_name,
+                WithDecryption=decrypt
+            )
+            return response['Parameter']['Value']
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ParameterNotFound':
+                print(f"Error: SSM parameter not found: {parameter_name}")
+            else:
+                print(f"Error retrieving SSM parameter {parameter_name}: {e}")
+            raise
+
+    def _load_database_config(self):
+        """Load database configuration from AWS Systems Manager Parameter Store."""
+        print("Loading database configuration from SSM Parameter Store...")
+
+        try:
+            # Fetch database credentials from SSM
+            # Adjust parameter names to match your SSM structure
+            self.db_config = {
+                'host': self._get_ssm_parameter(f"{self.ssm_parameter_prefix}/host"),
+                'port': self._get_ssm_parameter(f"{self.ssm_parameter_prefix}/port"),
+                'database': self._get_ssm_parameter(f"{self.ssm_parameter_prefix}/name"),
+                'user': self._get_ssm_parameter(f"{self.ssm_parameter_prefix}/user"),
+                'password': self._get_ssm_parameter(f"{self.ssm_parameter_prefix}/password"),
+            }
+            print("✓ Database configuration loaded from SSM")
+        except (ClientError, BotoCoreError) as e:
+            print(f"\nError loading database configuration from SSM: {e}")
+            print(f"\nExpected SSM parameters under prefix: {self.ssm_parameter_prefix}")
+            print("  - {prefix}/host")
+            print("  - {prefix}/port")
+            print("  - {prefix}/name")
+            print("  - {prefix}/user")
+            print("  - {prefix}/password")
+            print("\nMake sure these parameters exist in AWS Systems Manager Parameter Store")
+            print("and that your IAM role has permission to read them (ssm:GetParameter)")
             sys.exit(1)
 
     def connect_database(self):
